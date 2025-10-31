@@ -1,13 +1,9 @@
-# OpenAI config
-OAI_KEY = 'sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' # https://platform.openai.com/api-keys
-OAI_LLM = 'gpt-4o-mini'                                              # https://platform.openai.com/docs/models
-
-# Ollama config
-OLLAMA_URL = 'http://localhost:11434/'                               # Ollama API endpoint (Ensure your Ollama service is public)
-OLLAMA_LLM = 'llama3.1:8b'                                           # https://ollama.com/library
-
-# Default LLM
-DEFAULT_LLM = 'ollama'                                               # ollama or oai (-G and -O flag overide this default)
-
-# RSS feeds
-NEWS = 'https://www.wired.com/feed/category/science/latest/rss'
+# config.py example
+DEFAULT_LLM = 'ollama'
+OAI_KEY = 'your_oai_key'
+OAI_LLM = 'gpt-4'
+OLLAMA_URL = 'http://localhost:11434/' 
+OLLAMA_LLM = 'gpt-oss:20b'
+GROK_KEY = 'your_grok_key'
+GROK_LLM = 'grok-4'
+NEWS = 'https://example.com/news/rss'
