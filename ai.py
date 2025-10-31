@@ -5,257 +5,312 @@ import argparse
 import datetime
 import requests
 import platform
+import logging
+from contextlib import nullcontext
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.live import Live
 from rich.panel import Panel
-import config # Edit the config.py file
+import config  # Edit the config.py file
 
 console = Console()
 
 DEBUG = False
+HISTORY_FILE = '.aicli_history.json'
+LAST_OUTPUT_FILE = '.aicli_last'
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+SYSTEM_PROMPTS = {
+    'base': ["You are a helpful AI assistant."],
+    'security_audit': ["Your task is to perform a thorough security audit on the provided code, identifying potential vulnerabilities and suggesting mitigations."],
+    'extract_wisdom': ["Your task is to extract wisdom, summarize, and provide key insights from the content. Do not leave out any important facts or details that may influence the understanding. Organizing information in bullet points is preffered."],
+    'explain_code': ["Your task is to explain the provided code in detail, breaking down its functionality and purpose. Do not explain the basic fundamentals or simple functions, such as printing."],
+    'optimize_code': ["Your task is to analyze the provided code and suggest optimizations for improved performance or readability. Repeat the code in full as provided, but with brief comments on the same line."],
+    'find_bugs': ["Your task is to carefully analyze the code for potential bugs, issues, or vulnerabilities."],
+    'document': ["Your task is to generate comprehensive documentation for the provided code, including function descriptions and usage examples."],
+    'architect': ["Your task is to propose a detailed software architecture for the described problem, considering scalability and maintainability."],
+    'refactor': ["Your task is to suggest a comprehensive refactoring strategy for the provided code, improving its structure and maintainability."],
+    'news': ["Your task is summarize the provided news feed. Seperate the news in segments, like International News, National News, Science and Tech, Cyber Security, and so on. Do not leave out any important details. Ensure you summarize each item. Do not include advertisements."]
+}
+
+PROMPT_MAP = {
+    'security_audit': "Perform a security audit on the provided code",
+    'extract_wisdom': "Summarize and extract key insights",
+    'explain_code': "Explain the provided code",
+    'optimize_code': "Suggest optimizations",
+    'find_bugs': "Analyze code for potential issues",
+    'document': "Generate documentation for code",
+    'architect': "Propose architecture for the described problem",
+    'refactor': "Suggest refactoring strategys for the provided code"
+}
+
+class ColorHelpFormatter(argparse.HelpFormatter):
+    def __init__(self, *args, **kwargs):
+        kwargs['max_help_position'] = 30
+        super().__init__(*args, **kwargs)
+
+    def _format_action_invocation(self, action):
+        if not action.option_strings:
+            return super()._format_action_invocation(action)
+        colored = [f"\033[32m{opt}\033[0m" for opt in action.option_strings]
+        return ', '.join(colored)
 
 def get_os():
-    OS = False
+    """Get the operating system information."""
     system = platform.system()
     if system == "Linux":
         try:
             with open("/etc/os-release") as f:
                 lines = f.readlines()
             os_info = dict(line.strip().split("=", 1) for line in lines if "=" in line)
-            OS = "{0} {1}".format(os_info.get('NAME', 'Unknown'), os_info.get('VERSION', ''))
+            return "{0} {1}".format(os_info.get('NAME', 'Unknown'), os_info.get('VERSION', ''))
         except FileNotFoundError:
-            pass
+            return "Linux"
     elif system == "Windows":
-        OS = "Windows {0}".format(platform.win32_ver()[0])
+        return "Windows {0}".format(platform.win32_ver()[0])
     elif system == "Darwin":
-        OS = "macOS {0}".format(platform.mac_ver()[0])
-    else:
-        OS = system
-    if OS:
-        OS = OS.replace('"', '')
-    return OS
+        return "macOS {0}".format(platform.mac_ver()[0])
+    return system.replace('"', '')
+
+def load_history():
+    """Load chat history from file."""
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, 'r') as f:
+            return json.load(f)
+    return []
+
+def save_history(history):
+    """Save chat history to file."""
+    with open(HISTORY_FILE, 'w') as f:
+        json.dump(history, f, indent=4)
+
+def clear_history():
+    """Clear chat history."""
+    if os.path.exists(HISTORY_FILE):
+        os.remove(HISTORY_FILE)
+    logger.info("Chat history cleared.")
+
+def view_history():
+    """View chat history."""
+    history = load_history()
+    if not history:
+        console.print("No chat history.")
+        return
+    for msg in history:
+        role = msg['role'].upper()
+        content = msg['content']
+        console.print(f"[bold]{role}:[/bold] {content}")
+
+def get_llm_handler(llm):
+    """Get LLM-specific request handler."""
+    if llm == 'oai':
+        return {
+            'url': "https://api.openai.com/v1/chat/completions",
+            'headers': {"Authorization": f"Bearer {os.getenv('OAI_KEY', config.OAI_KEY)}"},
+            'model': config.OAI_LLM
+        }
+    elif llm == 'ollama':
+        return {
+            'url': config.OLLAMA_URL + 'api/chat',
+            'headers': {},
+            'model': config.OLLAMA_LLM
+        }
+    elif llm == 'grok':
+        return {
+            'url': "https://api.x.ai/v1/chat/completions",
+            'headers': {"Authorization": f"Bearer {os.getenv('GROK_KEY', config.GROK_KEY)}"},
+            'model': config.GROK_LLM
+        }
+    raise ValueError("Invalid LLM")
 
 def stream_api_response(chat_history, args):
+    """Stream response from API with improved error handling."""
+    llm = args.llm or config.DEFAULT_LLM
+    try:
+        handler = get_llm_handler(llm)
+    except ValueError as e:
+        logger.error(e)
+        sys.exit(1)
+
     payload = {
         "messages": chat_history,
         "stream": True,
-        "model": False
+        "model": handler['model']
     }
 
     hist_output = ''
-    
-    if args.G:
-        LLM = 'oai'
-    elif args.O:
-        LLM = 'ollama'
-    else:
-        LLM = config.DEFAULT_LLM
+    try:
+        response = requests.post(handler['url'], stream=True, json=payload, headers=handler['headers'])
+        response.raise_for_status()
+    except requests.RequestException as e:
+        logger.error(f"API request failed: {e}")
+        return ''
 
-    # OpenAI
-    if LLM == 'oai':
-        payload['model'] = config.OAI_LLM
-        headers = {"Authorization": "Bearer " + config.OAI_KEY}
-        response = requests.post("https://api.openai.com/v1/chat/completions", stream=True, json=payload, headers=headers)
-    # Ollama
-    elif LLM == 'ollama':
-        payload['model'] = config.OLLAMA_LLM
-        response = requests.post(config.OLLAMA_URL + 'api/chat', stream=True, json=payload)
-    else:
-        print("Invalid LLM\naoi     OR     ollama")
-        exit()
-
-    # Print time/LLM
     if not args.x:
-        console.log('[bold black]' + payload['model'])
+        console.log(f'[bold black]{payload["model"]}')
 
-    response.raise_for_status()
-    # Print output *without* markdown formatting
-    if args.x:
+    if args.json_output:
+        try:
+            full_response = ''.join(line.decode('utf-8') for line in response.iter_lines() if line)
+            hist_output = json.loads(full_response)
+            console.print(json.dumps(hist_output, indent=4))
+        except json.JSONDecodeError:
+            logger.error("Failed to parse JSON output.")
+        return hist_output
+
+    with (Live(console=console, refresh_per_second=8) if not args.x else nullcontext()) as live:
         for line in response.iter_lines():
             if line:
                 try:
-                    if LLM == 'oai':
-                        char = json.loads(line.decode("utf-8")[6:])['choices'][0]['delta']['content']
+                    if llm == 'oai' or llm == 'grok':
+                        data = json.loads(line.decode("utf-8")[6:] if line.startswith(b'data: ') else line.decode("utf-8"))
+                        char = data['choices'][0]['delta'].get('content', '')
                     else:
                         char = json.loads(line.decode("utf-8"))['message']['content']
                     hist_output += char
-                    print(char, end='')
-                except json.JSONDecodeError:
-                    pass
-                except KeyError:
-                    pass
-        print()
-    # Print output *with* markdown formatting
-    else:
-        with Live(console=console, refresh_per_second=8) as live:
-            for line in response.iter_lines():
-                if line:
-                    try:
-                        if LLM == 'oai':
-                            char = json.loads(line.decode("utf-8")[6:])['choices'][0]['delta']['content']
-                        else:
-                            char = json.loads(line.decode("utf-8"))['message']['content']
-                        hist_output += char
+                    if not args.x:
                         markdown = Markdown(hist_output)
                         live.update(Panel(markdown))
-                    except json.JSONDecodeError:
-                        pass
-                    except KeyError:
-                        pass
-    # Hi
+                    else:
+                        print(char, end='', flush=True)
+                except (json.JSONDecodeError, KeyError):
+                    pass
+    if args.x:
+        print()
     if not args.x:
         console.log('[bold black]done')
-
     return hist_output
 
 def extract_command(output):
-    command = []
+    """Extract commands from output."""
     command_list = ['bash', 'sh']
-    outputs = output.split('```')
-    # Iterate through code blocks
-    for snip in outputs:
-        # Logic to determine language
-        for lang in command_list:
-            if snip[:len(lang)] == lang:
-                command += [snip[len(lang)+1:][:-1]]
-    return command
+    return [snip[len(lang)+1:].strip() for snip in output.split('```') for lang in command_list if snip.strip().startswith(lang)]
 
 def extract_code(output):
-    code = []
+    """Extract code from output."""
     code_list = ['python', 'java', 'javascript', 'cpp', 'c', 'ruby', 'html', 'css', 'php', 'sql', 'go', 'rust', 'perl', 'typescript', 'lua']
-    outputs = output.split('```')
-    # Iterate through code blocks
-    for snip in outputs:
-        # Logic to determine language
-        for lang in code_list:
-            if snip[:len(lang)] == lang:
-                code += [snip[len(lang)+1:][:-1]]
-    return code
+    return [snip[len(lang)+1:].strip() for snip in output.split('```') for lang in code_list if snip.strip().startswith(lang)]
+
+def build_system_prompt(args, query):
+    """Build modular system prompt from config."""
+    system_message = SYSTEM_PROMPTS.get('base', []).copy()
+
+    now = datetime.datetime.now().strftime("%Y/%m/%d %H:%M")
+    system_message.append(f"The current date and time is {now}.")
+
+    OS = get_os()
+    if OS:
+        system_message.append(f"The user operating system is {OS}.")
+
+    if not args.x:
+        system_message.append("Your response should be in markdown format.")
+
+    prompt_key = next((k for k in PROMPT_MAP if getattr(args, k, False)), None)
+    if prompt_key:
+        system_message.extend(SYSTEM_PROMPTS.get(prompt_key, []))
+
+    if args.N:
+        system_message.extend(SYSTEM_PROMPTS.get('news', []))
+
+    return ' '.join(system_message)
 
 def main():
-    parser = argparse.ArgumentParser(description="AI Assistant using Ollama API")
-    parser.add_argument("query", nargs="*", help="Query for the AI")
+    if len(sys.argv) > 1 and sys.argv[1] == 'history':
+        parser = argparse.ArgumentParser(description="AI CLI Assistant - History Management", formatter_class=ColorHelpFormatter)
+        parser.add_argument('action', choices=['view', 'clear'], help="Action to perform on history")
+        args = parser.parse_args(sys.argv[2:])  # Parse from action onwards
 
-    # ARG LLM Provider
-    parser.add_argument("-O", action="store_true", help="Use Ollama")
-    parser.add_argument("-G", action="store_true", help="Use OpenAI (GPT)")
+        if args.action == 'view':
+            view_history()
+        elif args.action == 'clear':
+            clear_history()
+        sys.exit(0)
 
-    # ARG Functions
+    # Main query parser
+    parser = argparse.ArgumentParser(description="AI CLI Assistant", formatter_class=ColorHelpFormatter)
+    # LLM Provider
+    parser.add_argument("--llm", choices=['oai', 'ollama', 'grok'], help="Select LLM provider")
+
+    # Functions
     parser.add_argument("-E", action="store_true", help="Extract command(s) from last output")
     parser.add_argument("-C", action="store_true", help="Extract code from last output")
     parser.add_argument("-N", action="store_true", help="Show the latest news")
 
-    # ARG Formatting
+    # Formatting
     parser.add_argument("-l", action="store_true", help="Print the last output")
     parser.add_argument("-x", action="store_true", help="Remove formatting from output")
+    parser.add_argument("--json-output", action="store_true", help="Output in JSON format")
 
-    # ARG Engineering prompts
-    parser.add_argument("--security-audit", action="store_true", help="Perform a security audit on the provided code")
-    parser.add_argument("--extract-wisdom", action="store_true", help="Summarize and extract key insights")
-    parser.add_argument("--explain-code", action="store_true", help="Explain the provided code")
-    parser.add_argument("--optimize-code", action="store_true", help="Suggest optimizations")
-    parser.add_argument("--find-bugs", action="store_true", help="Analyze code for potential issues")
-    parser.add_argument("--document", action="store_true", help="Generate documentation for code")
-    parser.add_argument("--architect", action="store_true", help="Propose architecture for the described problem")
-    parser.add_argument("--refactor", action="store_true", help="Suggest refactoring strategys for the provided code")
+    # Engineering prompts
+    for flag, desc in PROMPT_MAP.items():
+        parser.add_argument(f"--{flag}", action="store_true", help=desc)
+
+    parser.add_argument("query", nargs="*", help="Query for the AI")
 
     args = parser.parse_args()
 
-    # Print previous response
+    # Handle last output actions
     if args.l or args.E or args.C:
-        # Open history file to print previous output from LLM
-        with open('.aicli_last', 'r') as f:
-            output = f.read()
-            # Determine if output is wrapped in code wrappers
+        try:
+            with open(LAST_OUTPUT_FILE, 'r') as f:
+                output = f.read()
             if args.C:
-                code = extract_code(output)
-                for c in code:
+                for c in extract_code(output):
                     print(c)
             elif args.E:
-                code = extract_command(output)
-                for c in code:
+                for c in extract_command(output):
                     print(c)
             elif args.x:
                 print(output)
             else:
-                # Print output w/ markdown using rich library
-                markdown = Markdown(output)
-                console.print(markdown)
-        exit()
+                console.print(Markdown(output))
+        except FileNotFoundError:
+            logger.error("No last output found.")
+        sys.exit(0)
 
-    # Check if there's piped input
-    if not sys.stdin.isatty():
-        piped_input = sys.stdin.read().strip()
-    else:
-        piped_input = None
+    # Piped input
+    piped_input = sys.stdin.read().strip() if not sys.stdin.isatty() else None
 
-    # Construct the query
+    # Construct query
     if piped_input:
         query = f"<content>{piped_input}</content>\n\n" + " ".join(args.query)
     elif args.N:
         try:
             resp = requests.get(config.NEWS).text
-        except:
-            print("Failed to fetch news feed...")
-            exit()
-        query = f"<news>{resp}</news>\n\nSummarize the news articles provided. Only reply with the summarized version of each news item. Reply with beautiful markdown formatting and make sure to include any related links."
+            query = f"<news>{resp}</news>\n\nSummarize the news articles provided."
+        except requests.RequestException:
+            logger.error("Failed to fetch news feed.")
+            sys.exit(1)
     else:
         query = " ".join(args.query)
 
-    # Create system prompt
-    system_message = []
+    if not query and not args.N:
+        parser.print_help()
+        sys.exit(0)
 
-    # Add date & time to system prompt
-    now = datetime.datetime.now()
-    nowdate = now.strftime("%Y/%m/%d %H:%M")
-    system_message += ["The current date and time is {0}.".format(nowdate)]
+    system_content = build_system_prompt(args, query)
 
-    # Add OS details to the prompt
-    OS = get_os()
-    if OS:
-        system_message += ["The user operating system is {0}.".format(OS)]
-
-    # Prompt AI to respond with markdown
-    if not args.x:
-        system_message += ["Your response should be in markdown format."]
-    
-    # Generic prompts to curate output
-    if args.extract_wisdom:
-        system_message += ["Your task is to extract wisdom, summarize, and provide key insights from the content. Do not leave out any important facts or details that may influence the understanding. Organizing information in bullet points is preffered."]
-    elif args.explain_code:
-        system_message += ["Your task is to explain the provided code in detail, breaking down its functionality and purpose. Do not explain the basic fundamentals or simple functions, such as printing."]
-    elif args.optimize_code:
-        system_message += ["Your task is to analyze the provided code and suggest optimizations for improved performance or readability. Repeat the code in full as provided, but with brief comments on the same line."]
-    elif args.find_bugs:
-        system_message += ["Your task is to carefully analyze the code for potential bugs, issues, or vulnerabilities."]
-    elif args.document:
-        system_message += ["Your task is to generate comprehensive documentation for the provided code, including function descriptions and usage examples."]
-    elif args.architect:
-        system_message += ["Your task is to propose a detailed software architecture for the described problem, considering scalability and maintainability."]
-    elif args.refactor:
-        system_message += ["Your task is to suggest a comprehensive refactoring strategy for the provided code, improving its structure and maintainability."]
-    elif args.security_audit:
-        system_message += ["Your task is to perform a thorough security audit on the provided code, identifying potential vulnerabilities and suggesting mitigations."]
-    elif args.N:
-        system_message += ["Your task is summarize the provided news feed. Seperate the news in segments, like International News, National News, Science and Tech, Cyber Security, and so on. Do not leave out any important details. Ensure you summarize each item. Do not include advertisements."]
-
-    # Define chat history list
-    chat_history = [
-        {"role": "system", "content": ' '.join(system_message)},
-        {"role": "user", "content": query}
-    ]
+    history = load_history()
+    chat_history = [{"role": "system", "content": system_content}] + history + [{"role": "user", "content": query}]
 
     if DEBUG:
-        print('[DEBUG] SYSTEM PROMPT:')
-        for chat in chat_history:
-            print('ROLE: {0:<8} CONTENT: {1}'.format(chat['role'], chat['content']))
+        logger.debug("SYSTEM PROMPT: %s", system_content)
 
-    # Call the selected API
     output = stream_api_response(chat_history, args)
-    # Write output to file in event -l is called for previous response
-    with open('.aicli_last', 'w') as f:
-        f.write(''.join(output))
+
+    if output:
+        with open(LAST_OUTPUT_FILE, 'w') as f:
+            f.write(output)
+        history.append({"role": "user", "content": query})
+        history.append({"role": "assistant", "content": output})
+        save_history(history)
+
+    # Tool integration example (web search placeholder)
+    if 'web search' in query.lower():
+        logger.info("Web search integration can be added here.")
 
 if __name__ == "__main__":
     main()
