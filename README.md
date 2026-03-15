@@ -1,3 +1,11 @@
+
+## This tool has been neglected, and has been rendered obsolete by opencode and claude code. RIP.
+
+https://opencode.ai/
+https://claude.com/product/claude-code
+
+
+
 # AICLI <3
 **Simple python interface between Ollama's API and your CLI**
 
